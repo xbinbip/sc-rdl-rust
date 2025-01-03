@@ -1,0 +1,21 @@
+# sc-rdl Config file 
+degug = true
+
+[spic]
+
+login = "kgm@redlineekb.ru"
+password = "5Amxqv"
+
+[database]
+
+db_type = "sqlite"
+
+[database.sqlite]
+
+name = "rdl.db"
+
+
+[server]
+
+address = "127.0.0.1"
+port = "4339"

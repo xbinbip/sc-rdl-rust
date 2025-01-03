@@ -1,0 +1,10 @@
+{
+    "errorLens.codeLensLength": {
+        "min": 0,
+        "max": 200
+    },
+    "errorLens.codeLensEnabled": false,
+    "errorLens.fontWeight": "normal",
+    "errorLens.gutterIconsEnabled": true,
+    "errorLens.gutterIconSet": "emoji"
+}
