@@ -60,6 +60,7 @@ impl Settings {
 }
 
 
+
 fn load_config() -> Result<Config, ConfigError> {
     let s = config::Config::builder()
         .add_source(config::File::with_name("./src/config/rdl.toml"))

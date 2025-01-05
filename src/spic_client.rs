@@ -1,29 +1,18 @@
 use std::error::Error;
 use serde::{Deserialize, Serialize};
 
-use reqwest::{Client, Response};
+#[allow(unused,unused_variables,dead_code)]
+
+use reqwest::{header, Client, Response};
+use serde_json::json;
 
 const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
 const BASE_URL: &str = "http://login.scout-gps.ru";
 
 #[derive(Debug)]
-struct SpicClient {
+pub struct SpicClient {
     client: Client,
     endpoints: SpicUrl
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SpicRequest {
-    // Define fields according to the WSDL
-    // #[serde(rename = "SomeField")]
-    // some_field: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SpicResponse {
-    // Define fields according to the WSDL response
-    // #[serde(rename = "SomeResponseField")]
-    // some_response_field: String,
 }
 
 #[derive(Debug)]
@@ -31,7 +20,7 @@ struct Url(String);
 
 macro_rules! spic_url {
     ($expr:expr) => {
-        Url(concat!("http://spic.scout-gps.ru/", $expr).to_string())
+        Url(format!("{}/{}", BASE_URL, $expr))
     };
 }
 
@@ -93,8 +82,74 @@ impl SpicClient {
         }
     }
 
-    async fn authenticate(&self) -> Result<Response, Box<dyn Error>> {
-        self.client.post(self.endpoints.spic_authorization_service.0).send().await
+    pub async fn authenticate(&self) -> Result<Response, Box<dyn Error>> {
+
+        // TODO: get credentials from config
+        let json_data = json!({
+            "Login": "kgm@redlineekb.ru",
+            "Password": "5Amxqv",
+            "TimeZoneOlsonId": "Asia/Yekaterinburg",
+            "CultureName": "ru-ru",
+            "UiCultureName": "ru-ru"
+        });
+
+        let response =self.client.post(&self.endpoints.spic_authorization_service.0)
+        .json(&json_data)
+        .send()
+        .await;
+
+        match response {
+            Ok(response) => Ok(response),
+            Err(error) => Err(Box::new(error))
+        }
     }
 }
 
+#[derive(Debug,Deserialize)]
+struct AuthResponse {
+    #[serde(rename = "IsAuthorized")]
+    is_authorized: bool,
+    #[serde(rename = "IsAuthenticated")]
+    is_authenticated: bool,
+    #[serde(rename = "UserId")]
+    user_id: i32,
+    #[serde(rename = "UserName")]
+    user_name: String,
+    #[serde(rename = "SessionId")]
+    session_id: String,
+    #[serde(rename = "ExpireDate")]
+    expire_date: String
+}
+
+impl AuthResponse {
+    fn from_json<'a>(json_data: &'a str) -> Self {
+        serde_json::from_str(json_data).expect("Unable to parse auth response")
+    }
+
+    fn new() -> Self {
+        AuthResponse {
+            is_authorized: false,
+            is_authenticated: false,
+            user_id: 0,
+            user_name: "".to_string(),
+            session_id: "".to_string(),
+            expire_date: "".to_string()
+        }
+    }
+    
+}
+
+pub fn init_client() -> SpicClient {
+
+    let mut headers = header::HeaderMap::new();
+    headers.insert("Content-Type", header::HeaderValue::from_static("application/json"));
+    headers.insert("Accept", header::HeaderValue::from_static("application/json; charset=utf-8"));
+
+    
+    let client = Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
+        .default_headers(headers)
+        .build()
+        .expect("Unable to create reqwest client");
+    SpicClient::new(client)
+}
