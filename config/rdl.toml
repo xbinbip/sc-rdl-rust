@@ -1,5 +1,5 @@
 # sc-rdl Config file 
-degug = true
+debug = true
 
 [spic]
 
@@ -13,9 +13,12 @@ db_type = "sqlite"
 [database.sqlite]
 
 name = "rdl.db"
+timeout = 5000
+maximum_connection_pool_size = 5
 
 
 [server]
 
 address = "127.0.0.1"
 port = "4339"
+request_timeout = 5000

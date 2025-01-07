@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chrono = "0.4.39"
+chrono = { version = "0.4.26", features = ["serde"] } # "0.4.39" 
 config = "0.15.4"
+keyring = { version = "3.6.1", features = ["windows-native"] }
 reqwest = { version = "0.12.12", features = ["json", "blocking"] }
 rusqlite = "0.32.1"
 serde = "1.0.217"
 serde_json = "1.0.134"
+thiserror = "2.0.9"
 tokio = { version = "1.31.0", features = ["full"] }
