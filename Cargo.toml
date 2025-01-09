@@ -11,5 +11,5 @@ reqwest = { version = "0.12.12", features = ["json", "blocking"] }
 rusqlite = "0.32.1"
 serde = "1.0.217"
 serde_json = "1.0.134"
-thiserror = "2.0.9"
-tokio = { version = "1.31.0", features = ["full"] }
+thiserror = "2.0.10"
+tokio = { version = "1.43.0", features = ["full"] }

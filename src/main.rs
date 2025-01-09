@@ -20,6 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Authentication failed");
         return Err("Authentication failed".into());
     }
+    println!("Number of units: {}", client.number_of_units().await?);
+
+    let unit_list = client.unit_list().await?;
+    dbg!(&unit_list.first());
     Ok(())
 
 }
