@@ -1,17 +1,28 @@
+use chrono::Duration;
 #[allow(unused, unused_variables, dead_code)]
-
+// Работает? не трогай. Ретрай обязательно сделать, с проверкой того что вернули подписки, т.к у них есть задержка
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{borrow::Cow, error::Error, io::empty, ops::Sub};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    error::Error,
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use keyring::Entry;
 
 use reqwest::{header, Client};
 use serde_json::json;
 
+use crate::rdl_config::{SpicConfig, CONFIG};
+use crate::conf as conf;
+
 const DEFAULT_USER_AGENT: &'static str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
 const BASE_URL: &'static str = "http://login.scout-gps.ru/spic";
+const LOCAL_TIME_SHIFT: i64 = 5;
 
 fn store_auth_data(token: &str, expiration: &DateTime<Utc>) -> Result<(), Box<dyn Error>> {
     let token_entry = Entry::new("sc-rdl", "auth_token")?;
@@ -50,7 +61,7 @@ where
         .next()
         .unwrap()
         .parse::<i64>()
-        .unwrap();
+        .expect("Failed to parse date");
 
     Ok(Utc.timestamp_millis_opt(ms).unwrap())
 }
@@ -67,18 +78,60 @@ macro_rules! endpoint {
 pub struct SpicClient {
     client: Client,
     auth_token: Option<AuthToken>,
+    subman: Arc<Mutex<SubscriptionManager>>,
+    config: Option<SpicConfig>,
+}
+
+// Add retry mechanism for network requests
+async fn with_retry<F, T, E>(f: F, max_retries: u32) -> Result<T, E>
+where
+    F: Fn() -> dyn Future<Output = Result<T, E>>,
+{
+    //TODO: Implement exponential backoff retry logic
+    todo!();
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Uuid {
+    #[serde(rename = "Id")]
+    uuid: String,
+}
+
+impl Uuid {
+    fn from_subscription_response(json_data: &String) -> Result<Uuid, SpicError> {
+        match serde_json::from_str::<Uuid>(&json_data) {
+            Ok(data) => Ok(data),
+            Err(e) => Err(SpicError::JsonError {
+                caller: "Uuid::from_subscription_response",
+                source: e,
+                data: json_data.to_string(),
+            }),
+        }
+    }
+
+    fn from_string(uuid: String) -> Self {
+        Uuid { uuid }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.uuid
+    }
+
+    fn as_string(&self) -> String {
+        self.uuid.clone()
+    }
 }
 
 #[derive(Debug)]
 struct AuthToken {
-    token: String,
+    token: Uuid,
     expiration: DateTime<Utc>,
 }
 
 impl AuthToken {
     fn new(token: String, date: DateTime<Utc>) -> Self {
         AuthToken {
-            token,
+            token: Uuid::from_string(token),
             expiration: date,
         }
     }
@@ -95,11 +148,16 @@ impl AuthToken {
     }
 }
 
-impl SpicClient {
+impl SpicClient{
     fn new(client: Client) -> Self {
+
+        let config:SpicConfig = conf!(spic);
+
         SpicClient {
             client,
             auth_token: None,
+            subman: Arc::new(Mutex::new(SubscriptionManager::new())),
+            config: Some(config),
         }
     }
 
@@ -108,12 +166,11 @@ impl SpicClient {
         headers.insert(
             "ScoutAuthorization",
             header::HeaderValue::from_str(token).unwrap(),
-            );
-            
+        );
+
         headers.insert(
             "Content-Type",
             header::HeaderValue::from_static("application/json"),
-            
         );
 
         headers.insert(
@@ -129,6 +186,11 @@ impl SpicClient {
 
     pub async fn authenticate(&mut self) -> Result<bool, SpicError> {
 
+        let _config = self.config.as_ref().unwrap();
+
+        let (login, password) = (_config.login.as_str(), _config.password.as_str());
+
+
         if let Ok((token, expiration)) = get_stored_auth_data() {
             println!(
                 "Stored auth data found, \n Token: {}\n Expiration: {}",
@@ -138,15 +200,17 @@ impl SpicClient {
 
             if !self.auth_token.as_ref().unwrap().is_expired() {
                 println!("Token is not expired");
-                self.client = self.authenticated_client(&self.auth_token.as_ref().unwrap().token);
+                self.client =
+                    self.authenticated_client(&self.auth_token.as_ref().unwrap().token.as_string());
                 return Ok(true);
             }
         }
 
+
         // TODO: get credentials from config
         let json_data = json!({
-            "Login": "kgm@redlineekb.ru",
-            "Password": "5Amxqv",
+            "Login": login,
+            "Password": password,
             "TimeZoneOlsonId": "Asia/Yekaterinburg",
             "CultureName": "ru-ru",
             "UiCultureName": "ru-ru"
@@ -168,13 +232,14 @@ impl SpicClient {
                 let auth_response = AuthResponse::from_json(&body)?;
 
                 if auth_response.is_authorized && auth_response.is_authenticated {
-                    let _ = store_auth_data(&auth_response.session_id, &auth_response.expire_date);
+                    let _ = store_auth_data(&auth_response.session_id,
+                         &{auth_response.expire_date - Duration::hours(LOCAL_TIME_SHIFT)});
 
                     println!(
                         "Authentication successful, user id: {}, session id: {}",
                         auth_response.user_id, auth_response.session_id
                     );
-                    
+
                     self.client = self.authenticated_client(&auth_response.session_id);
 
                     Ok(true)
@@ -196,13 +261,11 @@ impl SpicClient {
     }
 
     pub async fn number_of_units(&self) -> Result<i32, SpicError> {
-
         let response = self
             .client
             .get(endpoint!(UNITS_NUMBER_SERVICE))
             .send()
             .await?;
-
 
         match response.status() {
             // TODO: rewrite error handling using spicerror
@@ -223,12 +286,7 @@ impl SpicClient {
     }
 
     pub async fn unit_list(&self) -> Result<Vec<SpicUnit>, SpicError> {
-
-        let response = self
-            .client
-            .get(endpoint!(UNIT_LIST_SERVICE))
-            .send()
-            .await?;
+        let response = self.client.get(endpoint!(UNIT_LIST_SERVICE)).send().await?;
 
         match response.status() {
             reqwest::StatusCode::OK => {
@@ -246,11 +304,123 @@ impl SpicClient {
             }
         }
     }
+
+    pub async fn get_online_data(&self, unit_id: i32) -> Result<OnlineData, SpicError> {
+        let _subman = self.subman.clone();
+
+        let json_request = json!({
+            "UnitIds" : [unit_id]
+        });
+
+        let req = self
+            .client
+            .post(endpoint!(ONLINE_DATA_SUBSCRIBE))
+            .json(&json_request);
+
+        let response = req.send().await?;
+
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                let body = response.text().await?;
+                let data = serde_json::from_str::<SubscriptionResponse>(&body);
+
+                match data {
+                    Ok(data) => {
+                        if data.state.is_ok() {
+                            let subscription_token = data.session_id;
+                            _subman
+                                .lock()
+                                .unwrap()
+                                .add_subscription(unit_id, subscription_token.as_string());
+                        } else {
+                            println!("failed to subscribe to unit with id: {}", unit_id);
+                            return Err(SpicError::SubscriptionError {
+                                caller: "SpicClient::get_online_data",
+                                data: format!("failed to subscribe to unit with id: {}", unit_id),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "failed to subscribe to unit",
+                                ),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(SpicError::JsonError {
+                            caller: "SpicClient::get_online_data",
+                            source: e,
+                            data: body.to_string(),
+                        })
+                    }
+                }
+            }
+            _ => {
+                return Err(SpicError::NetworkError(
+                    response.error_for_status().unwrap_err(),
+                ));
+            }
+        }
+
+        let subscribed_json = json!({
+            "Id": _subman.lock().unwrap().subscriptions.get(&unit_id).unwrap().uuid,
+        });
+
+        let response = self
+            .client
+            .post(endpoint!(ONLINE_DATA_GET))
+            .json(&subscribed_json)
+            .send()
+            .await?;
+
+        match response.status() {
+            reqwest::StatusCode::OK => {
+                let body = response.text().await?;
+                let online_data_col = serde_json::from_str::<ODResponse>(&body);
+
+                match online_data_col {
+                    Ok(data) => {
+                        if data.is_ok() {
+                            let online_data = data
+                                .online_data_collection
+                                .data_collection
+                                .unwrap()
+                                .first()
+                                .unwrap()
+                                .clone();
+                            return Ok(online_data);
+                        } else {
+                            return Err(SpicError::ResponseError {
+                                caller: "SpicClient::get_online_data",
+                                data: format!(
+                                    "failed to get online data for unit with id: {}",
+                                    unit_id
+                                ),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "failed to get online data",
+                                ),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(SpicError::JsonError {
+                            caller: "SpicClient::get_online_data",
+                            source: e,
+                            data: body.to_string(),
+                        })
+                    }
+                }
+            }
+            _ => {
+                return Err(SpicError::NetworkError(
+                    response.error_for_status().unwrap_err(),
+                ));
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpicError {
-
     #[error("Network error: {0}/")]
     NetworkError(#[from] reqwest::Error),
 
@@ -258,10 +428,11 @@ pub enum SpicError {
     DateParseError(String),
 
     #[error("JSON parsing error: {source} \n in {caller}")]
-    JsonError{
+    JsonError {
         caller: &'static str,
+        data: String,
         #[source]
-        source: serde_json::Error
+        source: serde_json::Error,
     },
 
     #[error("Parse int error: {0}")]
@@ -269,6 +440,22 @@ pub enum SpicError {
 
     #[error("Authentication error: {0}")]
     AuthenticationError(String),
+
+    #[error("Subscription error: {source} \n in {caller}")]
+    SubscriptionError {
+        caller: &'static str,
+        data: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Response error: {data} \n in {caller}")]
+    ResponseError {
+        caller: &'static str,
+        data: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug)]
@@ -296,53 +483,56 @@ impl SpicEndpoint {
     const UNITS_NUMBER_SERVICE: Url = spic_url!("/Units/rest/");
     const UNIT_LIST_SERVICE: Url = spic_url!("/Units/rest/GetAllUnits");
     const UNIT_GROUP_SERVICE: Url = spic_url!("/UnitGroups");
+    const ONLINE_DATA_SUBSCRIBE: Url = spic_url!("/OnlineDataService/rest/Subscribe");
+    const ONLINE_DATA_GET: Url = spic_url!("/OnlineDataService/rest/GetOnlineData");
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SpicUnit {
     #[serde(rename = "Brand")]
-    brand: String,
+    pub brand: String,
     #[serde(rename = "Color")]
-    color: String,
+    pub color: String,
     #[serde(rename = "CompanyId")]
-    company_id: i32,
+    pub company_id: i32,
     #[serde(rename = "Description")]
-    description: String,
+    pub description: String,
     #[serde(rename = "GarageNumber")]
-    garage_number: String,
+    pub garage_number: String,
     #[serde(rename = "Model")]
-    model: String,
+    pub model: String,
     #[serde(rename = "Name")]
-    name: String,
+    pub name: String,
     #[serde(rename = "OlsonId")]
-    olson_id: String,
+    pub olson_id: String,
     #[serde(rename = "Owner")]
-    owner: String,
+    pub owner: String,
     #[serde(rename = "Power")]
-    power: String,
+    pub power: String,
     #[serde(rename = "Registration")]
-    registration: String,
+    pub registration: String,
     #[serde(rename = "StateNumber")]
-    state_number: String,
+    pub state_number: String,
     #[serde(rename = "UnitId")]
-    id: i32,
+    pub id: i32,
     #[serde(rename = "UnitTypeId")]
     #[serde(default)]
-    type_id: Option<i32>,
+    pub type_id: Option<i32>,
     #[serde(rename = "VinNumber")]
-    vin: String,
+    pub vin: String,
     #[serde(rename = "Year")]
-    year: String,
+    pub year: String,
 }
-
 
 impl SpicUnit {
     fn from_json<'a>(json_data: &'a String) -> Result<SpicUnit, SpicError> {
         match serde_json::from_str::<SpicUnit>(&json_data) {
             Ok(data) => Ok(data),
-            Err(e) => {
-                Err(SpicError::JsonError { caller: "SpicUnit::from_json", source: e })
-            }
+            Err(e) => Err(SpicError::JsonError {
+                caller: "SpicUnit::from_json",
+                source: e,
+                data: json_data.to_string(),
+            }),
         }
     }
 }
@@ -359,26 +549,31 @@ impl SpicUnitList {
             Ok(data) => Ok(data),
             Err(e) => {
                 println!("{}", e);
-                Err(SpicError::JsonError{ caller: "SpicUnitList::from_json", source: e })
+                Err(SpicError::JsonError {
+                    caller: "SpicUnitList::from_json",
+                    source: e,
+                    data: json_data.to_string(),
+                })
             }
         }
     }
-    
 }
 
 #[derive(Debug)]
-struct SubscriptionHandler {
+struct SubscriptionManager {
     subscriptions: std::collections::HashMap<i32, Subscription>,
 }
 
-impl SubscriptionHandler {
+impl SubscriptionManager {
     fn new() -> Self {
-        SubscriptionHandler {
+        SubscriptionManager {
             subscriptions: std::collections::HashMap::with_capacity(5),
         }
     }
 
     fn add_subscription(&mut self, unit_id: i32, uuid: String) {
+        println!("add subscription for unit_id: {}", unit_id);
+        println!("Subscription id: {}", uuid);
         self.subscriptions.insert(unit_id, Subscription::new(uuid));
     }
 
@@ -386,11 +581,20 @@ impl SubscriptionHandler {
         self.subscriptions.remove(&unit_id);
     }
     fn is_exist(&self, unit_id: i32) -> bool {
-        self.subscriptions.contains_key(&unit_id) 
+        self.subscriptions.contains_key(&unit_id)
     }
 
     fn clear_expired(&mut self) {
-        self.subscriptions.retain(|_, subscription| !subscription.is_expired());
+        self.subscriptions
+            .retain(|_, subscription| !subscription.is_expired());
+    }
+
+    fn get_subscription(&self, unit_id: i32) -> Option<&Subscription> {
+        if self.is_exist(unit_id) && !self.subscriptions.get(&unit_id).unwrap().is_expired() {
+            self.subscriptions.get(&unit_id)
+        } else {
+            None
+        }
     }
 }
 
@@ -414,7 +618,7 @@ impl Subscription {
     }
 }
 
-enum OnlineDataErrorCodes {
+enum ODErrorCodes {
     BadRequest = 200,
     RightsViolation = 201,
     InternalError = 202,
@@ -423,32 +627,112 @@ enum OnlineDataErrorCodes {
     OnlineDataNotFound = 205,
 }
 
-enum OnlineDataStatus {
-    None,
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+enum ODStatus {
+    #[serde(rename = "Ok")]
     Ok,
+    #[serde(rename = "Error")]
     Error,
+    #[serde(rename = "Busy")]
     Busy,
+    #[serde(rename = "PartialOk")]
     PartialOk,
+    #[serde(rename = "None")]
+    None,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct OnlineData{
+struct ODResponse {
+    #[serde(rename = "OnlineDataCollection")]
+    online_data_collection: ODCollection,
+    #[serde(rename = "State")]
+    state: ODResponseState,
+}
+
+impl ODResponse {
+    fn from_json<'a>(json_data: &'a String) -> Result<ODResponse, SpicError> {
+        match serde_json::from_str(&json_data) {
+            Ok(data) => Ok(data),
+            Err(e) => Err(SpicError::JsonError {
+                caller: "OnlineDataResponse::from_json",
+                source: e,
+                data: json_data.to_string(),
+            }),
+        }
+    }
+    fn is_ok(&self) -> bool {
+        self.state.is_ok()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ODCollection {
+    #[serde(rename = "DataCollection")]
+    data_collection: Option<Vec<OnlineData>>,
+    #[serde(rename = "Targets")]
+    targets: Vec<i32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SubscriptionResponse {
+    #[serde(rename = "SessionId")]
+    session_id: Uuid,
+    #[serde(rename = "State")]
+    state: ODResponseState,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ODValue {
+    #[serde(rename = "Value")]
+    value: ODStatus,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ODResponseState {
+    #[serde(rename = "ErrorCodes")]
+    error_codes: Vec<i32>,
+    #[serde(rename = "Status")]
+    status: ODValue,
+}
+
+impl ODResponseState {
+    fn is_ok(&self) -> bool {
+        self.status.value == ODStatus::Ok
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct OnlineData {
+    #[serde(rename = "Address")]
     address: String,
+    #[serde(
+        rename = "ConnectionDateTime",
+        deserialize_with = "deserialize_ms_date"
+    )]
     connection_date_time: DateTime<Utc>,
+    #[serde(rename = "DeviceId")]
     device_id: DeviceId,
+    #[serde(rename = "IsNavigationValid")]
     is_navigation_valid: bool,
+    #[serde(rename = "LastMessageTime", deserialize_with = "deserialize_ms_date")]
     last_message_time: DateTime<Utc>,
+    #[serde(rename = "Navigation")]
     navigation: NavigationData,
+    #[serde(rename = "NavigationTime", deserialize_with = "deserialize_ms_date")]
     navigation_time: DateTime<Utc>,
+    #[serde(rename = "TotalMessages")]
     total_messages: i32,
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct DeviceId {
-    protocol: String,
+    #[serde(rename = "Protocol")]
+    protocol: HashMap<String, String>,
+    #[serde(rename = "SerialId")]
     serial_id: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "PascalCase")]
 struct NavigationData {
     altitude_meters: i32,
     angle: i32,
@@ -458,7 +742,8 @@ struct NavigationData {
     satellites_count: i8,
     speed: i32,
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "PascalCase")]
 struct Location {
     latitude: f64,
     longitude: f64,
@@ -468,9 +753,11 @@ impl OnlineData {
     fn from_json<'a>(json_data: &'a String) -> Result<OnlineData, SpicError> {
         match serde_json::from_str::<OnlineData>(&json_data) {
             Ok(data) => Ok(data),
-            Err(e) => {
-                Err(SpicError::JsonError { caller: "OnlineData::from_json", source: e })
-            }
+            Err(e) => Err(SpicError::JsonError {
+                caller: "OnlineData::from_json",
+                source: e,
+                data: json_data.to_string(),
+            }),
         }
     }
 }
@@ -533,8 +820,6 @@ pub fn init_client() -> SpicClient {
 
     dbg!(&client);
 
-    let sh = SubscriptionHandler::new();
-
     SpicClient::new(client)
 }
 
@@ -552,11 +837,11 @@ fn test_is_normal() {
 #[cfg(test)]
 mod subscription_tests {
     use super::*;
-    use chrono::{Utc, Duration};
+    use chrono::{Duration, Utc};
 
     #[test]
     fn test_add_subscription() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.add_subscription(1, "uuid-1".to_string());
 
         assert!(handler.is_exist(1));
@@ -564,7 +849,7 @@ mod subscription_tests {
 
     #[test]
     fn test_add_subscription_duplicate() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.add_subscription(1, "uuid-1".to_string());
         handler.add_subscription(1, "uuid-2".to_string());
 
@@ -574,7 +859,7 @@ mod subscription_tests {
 
     #[test]
     fn test_remove_subscription() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.add_subscription(1, "uuid-1".to_string());
         handler.remove_subscription(1);
 
@@ -583,7 +868,7 @@ mod subscription_tests {
 
     #[test]
     fn test_remove_nonexistent_subscription() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.remove_subscription(1); // Removing without adding
 
         assert!(!handler.is_exist(1));
@@ -591,7 +876,7 @@ mod subscription_tests {
 
     #[test]
     fn test_is_exist() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.add_subscription(1, "uuid-1".to_string());
 
         assert!(handler.is_exist(1));
@@ -600,9 +885,9 @@ mod subscription_tests {
 
     #[test]
     fn test_clear_expired() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.add_subscription(1, "uuid-1".to_string());
-        
+
         // Simulate expiration
         let expired_subscription = Subscription {
             uuid: "uuid-expired".to_string(),
@@ -611,7 +896,10 @@ mod subscription_tests {
         handler.subscriptions.insert(2, expired_subscription);
 
         assert!(handler.subscriptions.get(&2).unwrap().is_expired());
-        println!("Subscription 2 is expired: {}", handler.subscriptions.get(&2).unwrap().is_expired());
+        println!(
+            "Subscription 2 is expired: {}",
+            handler.subscriptions.get(&2).unwrap().is_expired()
+        );
 
         handler.clear_expired();
 
@@ -621,7 +909,7 @@ mod subscription_tests {
 
     #[test]
     fn test_clear_expired_no_expired() {
-        let mut handler = SubscriptionHandler::new();
+        let mut handler = SubscriptionManager::new();
         handler.add_subscription(1, "uuid-1".to_string());
         handler.add_subscription(2, "uuid-2".to_string());
 
@@ -630,5 +918,16 @@ mod subscription_tests {
 
         assert!(handler.is_exist(1));
         assert!(handler.is_exist(2));
+    }
+
+    #[test]
+    fn test_get_subscription() {
+        let mut handler = SubscriptionManager::new();
+        handler.add_subscription(1, "uuid-1".to_string());
+        handler.add_subscription(2, "uuid-2".to_string());
+
+        assert!(handler.get_subscription(1).is_some());
+        assert!(handler.get_subscription(2).is_some());
+        assert!(handler.get_subscription(3).is_none());
     }
 }

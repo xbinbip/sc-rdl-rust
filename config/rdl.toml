@@ -1,5 +1,5 @@
 # sc-rdl Config file 
-debug = true
+debug_level = "debug" # lowercase string, one of "debug", "info", "warn", "error", "trace", "off"
 
 [spic]
 
@@ -12,9 +12,13 @@ db_type = "sqlite"
 
 [database.sqlite]
 
-name = "rdl.db"
-timeout = 5000
-maximum_connection_pool_size = 5
+path = "data/rdl.db"
+log_path = "data/rdl.db"
+pool_acquire_timeout = 10
+pool_idle_timeout = 3600
+minimum_connection_pool_size = 3
+maximum_connection_pool_size = 20
+pool_max_lifetime = 43200
 
 
 [server]

@@ -1,1 +1,6 @@
 /target
+.env
+/data
+/.vscode
+*.html
+sc-rdl-rust.code-workspace
